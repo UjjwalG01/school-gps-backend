@@ -76,6 +76,7 @@ function removeConnection(busId, ws) {
 
 /**
  * Broadcast telemetry data to all clients tracking a specific bus
+ * Prevent echoing back to the sender and safeguard against connection drops
  */
 function broadcastToBus(busId, data) {
   const clients = busConnections.get(busId);
@@ -88,10 +89,19 @@ function broadcastToBus(busId, data) {
   const message = JSON.stringify(data);
   let sentCount = 0;
 
-  clients.forEach(ws => {
+clients.forEach(ws => {
+    // 1. Optimization: Don't echo the packet back to the driver's phone
+    if (ws === senderWs) return;
+
+    // 2. Safety Check: Verify socket status
     if (ws.readyState === WebSocket.OPEN) {
-      ws.send(message);
-      sentCount++;
+      try {
+        ws.send(message);
+        sentCount++;
+      } catch (err) {
+        // 3. Defensive Fix: Catch rapid disconnect exceptions to keep server alive
+        console.log(`[WS BROADCAST WARNING] Client dropped during transmission frame`);
+      }
     }
   });
 
