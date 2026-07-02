@@ -221,7 +221,7 @@ wss.on('connection', (ws, req) => {
         };
 
         // Broadcast out to all tracking screens subscribed to this bus
-        broadcastToBus(decodedBusId, telemetryPayload);
+       broadcastToBus(decodedBusId, telemetryPayload, ws);
         
       } catch (e) {
         console.log(`[WS ERROR] Invalid payload shape on channel ${decodedBusId}`);
