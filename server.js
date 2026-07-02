@@ -206,11 +206,27 @@ wss.on('connection', (ws, req) => {
     // --- FIX: Broadcast telemetry when received directly over WebSockets ---
     ws.on('message', (message) => {
       try {
-        const incomingData = JSON.parse(message);
+      // 1. Safe Conversion: Convert incoming Buffer/Binary data into a clean string
+        const messageString = message.toString().trim();
+
+        // 2. Ping Filter: Silently absorb keep-alive pings sent by web browsers or admin tools
+        if (messageString === 'ping' || messageString === 'pong' || !messageString) {
+          if (messageString === 'ping') ws.send('pong'); // reply back to keep connection warm
+          return;
+        }
         
-        // Build uniform telemetry structure matching the POST schema
+        const incomingData = JSON.parse(messageString);
+
+        // 3. Sender Verification: If the message doesn't have coordinates, it's just an 
+        // admin panel client message or system handshake event. Log it quietly and return.
+        if (incomingData.latitude === undefined || incomingData.longitude === undefined) {
+          console.log(`[WS SYSTEM MESSAGE] Client control frame on channel ${decodedBusId}`);
+          return; 
+        }
+        
+       // 4. Build uniform telemetry payload structure
         const telemetryPayload = {
-          busId: decodedBusId, // enforce path safety boundary
+          busId: decodedBusId, // enforce safety boundary
           latitude: Number(incomingData.latitude),
           longitude: Number(incomingData.longitude),
           speed: Number(incomingData.speed) || 0,
@@ -219,6 +235,12 @@ wss.on('connection', (ws, req) => {
           timestamp: incomingData.timestamp || new Date().toISOString(),
           receivedAt: new Date().toISOString()
         };
+
+        // 5. Data Guard: Ensure coordinates aren't corrupted NaN values before broadcasting
+        if (isNaN(telemetryPayload.latitude) || isNaN(telemetryPayload.longitude)) {
+          console.log(`[WS WARNING] Skipped telemetry broadcast due to invalid coordinate values on ${decodedBusId}`);
+          return;
+        }
 
         // Broadcast out to all tracking screens subscribed to this bus
        broadcastToBus(decodedBusId, telemetryPayload, ws);
