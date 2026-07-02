@@ -15,17 +15,14 @@ const HEARTBEAT_TIMEOUT = 60000;  // 60 seconds timeout for pong response
 // =============================================================================
 const app = express();
 
-// CORS configuration - allow all origins for frontend connectivity
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type']
 }));
 
-// JSON body parser middleware
 app.use(express.json());
 
-// Health check endpoint (useful for deployment platforms)
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
@@ -34,21 +31,13 @@ app.get('/health', (req, res) => {
 // HTTP Server & WebSocket Server Setup
 // =============================================================================
 const server = http.createServer(app);
-
-// Create WebSocket server attached to the HTTP server
-const wss = new WebSocket.Server({ 
-  server,
-});
+const wss = new WebSocket.Server({ server });
 
 // =============================================================================
 // Connection Management - Organized by busId
 // =============================================================================
-// Map structure: busId -> Set of WebSocket connections
 const busConnections = new Map();
 
-/**
- * Add a WebSocket connection to a specific bus tracking group
- */
 function addConnection(busId, ws) {
   if (!busConnections.has(busId)) {
     busConnections.set(busId, new Set());
@@ -57,14 +46,10 @@ function addConnection(busId, ws) {
   console.log(`[WS] Client connected to track bus: ${busId}. Total clients: ${busConnections.get(busId).size}`);
 }
 
-/**
- * Remove a WebSocket connection from its bus tracking group
- */
 function removeConnection(busId, ws) {
   if (busConnections.has(busId)) {
     busConnections.get(busId).delete(ws);
     
-    // Clean up empty bus groups to free memory
     if (busConnections.get(busId).size === 0) {
       busConnections.delete(busId);
       console.log(`[WS] No more clients tracking bus: ${busId}. Group removed.`);
@@ -75,10 +60,9 @@ function removeConnection(busId, ws) {
 }
 
 /**
- * Broadcast telemetry data to all clients tracking a specific bus
- * Prevent echoing back to the sender and safeguard against connection drops
+ * FIXED: Added senderWs parameter to function signature to resolve scope crash
  */
-function broadcastToBus(busId, data) {
+function broadcastToBus(busId, data, senderWs = null) {
   const clients = busConnections.get(busId);
   
   if (!clients || clients.size === 0) {
@@ -89,17 +73,15 @@ function broadcastToBus(busId, data) {
   const message = JSON.stringify(data);
   let sentCount = 0;
 
-clients.forEach(ws => {
-    // 1. Optimization: Don't echo the packet back to the driver's phone
-    if (ws === senderWs) return;
+  clients.forEach(ws => {
+    // Safely skip echoing data back to the transmitting device
+    if (senderWs && ws === senderWs) return;
 
-    // 2. Safety Check: Verify socket status
     if (ws.readyState === WebSocket.OPEN) {
       try {
         ws.send(message);
         sentCount++;
       } catch (err) {
-        // 3. Defensive Fix: Catch rapid disconnect exceptions to keep server alive
         console.log(`[WS BROADCAST WARNING] Client dropped during transmission frame`);
       }
     }
@@ -112,33 +94,15 @@ clients.forEach(ws => {
 // =============================================================================
 // API Endpoints
 // =============================================================================
-
-/**
- * POST /api/telemetry
- * Receive GPS telemetry data from bus tracking devices
- * Immediately broadcasts to all WebSocket clients tracking that bus
- */
 app.post('/api/telemetry', (req, res) => {
   try {
     const { busId, latitude, longitude, speed, nextStop, timestamp, heading, altitude } = req.body;
 
-    // Validate required fields
-    if (!busId) {
-      return res.status(400).json({ error: 'Missing required field: busId' });
-    }
+    if (!busId) return res.status(400).json({ error: 'Missing required field: busId' });
     if (typeof latitude !== 'number' || typeof longitude !== 'number') {
-      return res.status(400).json({ error: 'Invalid coordinates: latitude and longitude must be numbers' });
+      return res.status(400).json({ error: 'Invalid coordinates' });
     }
 
-    // Validate coordinate ranges
-    if (latitude < -90 || latitude > 90) {
-      return res.status(400).json({ error: 'Invalid latitude: must be between -90 and 90' });
-    }
-    if (longitude < -180 || longitude > 180) {
-      return res.status(400).json({ error: 'Invalid longitude: must be between -180 and 180' });
-    }
-
-    // Build telemetry payload with server timestamp if not provided
     const telemetryData = {
       busId,
       latitude,
@@ -151,46 +115,32 @@ app.post('/api/telemetry', (req, res) => {
       receivedAt: new Date().toISOString()
     };
 
-    // Broadcast to all connected clients tracking this bus
     const clientCount = broadcastToBus(busId, telemetryData);
-
-    // Respond with success
-    res.status(200).json({
-      success: true,
-      message: 'Telemetry received and broadcasted',
-      busId,
-      clientsNotified: clientCount,
-      data: telemetryData
-    });
+    res.status(200).json({ success: true, clientsNotified: clientCount });
 
   } catch (error) {
     console.error('[API ERROR]', error.message);
-    res.status(500).json({ error: 'Internal server error', details: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // =============================================================================
-// WebSocket Connection Handling (Updated Sections)
+// WebSocket Connection Handling
 // =============================================================================
-
 wss.on('connection', (ws, req) => {
+  let decodedBusId = 'unknown';
   try {
-    // Robust parsing handles trailing slashes, hashes, and query parameters cleanly
     const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-    const pathParts = parsedUrl.pathname.split('/').filter(Boolean); // removes empty spaces
-    
-    // Path should be ['track', ':busId']
+    const pathParts = parsedUrl.pathname.split('/').filter(Boolean);
     const busId = pathParts[1];
 
     if (pathParts[0] !== 'track' || !busId) {
-      ws.close(4000, 'Invalid routing path. Use syntax: ws://server/track/:busId');
+      ws.close(4000, 'Invalid routing path.');
       return;
     }
 
-    const decodedBusId = decodeURIComponent(busId);
+    decodedBusId = decodeURIComponent(busId);
     console.log(`[WS] Handshake approved for bus: ${decodedBusId}`);
-
-    // Add connection to tracking group memory map
     addConnection(decodedBusId, ws);
 
     ws.send(JSON.stringify({
@@ -203,30 +153,25 @@ wss.on('connection', (ws, req) => {
     ws.isAlive = true;
     ws.on('pong', () => { ws.isAlive = true; });
 
-    // --- FIX: Broadcast telemetry when received directly over WebSockets ---
     ws.on('message', (message) => {
       try {
-      // 1. Safe Conversion: Convert incoming Buffer/Binary data into a clean string
         const messageString = message.toString().trim();
 
-        // 2. Ping Filter: Silently absorb keep-alive pings sent by web browsers or admin tools
+        // Absorb browser keep-alive frames smoothly
         if (messageString === 'ping' || messageString === 'pong' || !messageString) {
-          if (messageString === 'ping') ws.send('pong'); // reply back to keep connection warm
+          if (messageString === 'ping') ws.send('pong');
           return;
         }
         
         const incomingData = JSON.parse(messageString);
 
-        // 3. Sender Verification: If the message doesn't have coordinates, it's just an 
-        // admin panel client message or system handshake event. Log it quietly and return.
         if (incomingData.latitude === undefined || incomingData.longitude === undefined) {
           console.log(`[WS SYSTEM MESSAGE] Client control frame on channel ${decodedBusId}`);
           return; 
         }
         
-       // 4. Build uniform telemetry payload structure
         const telemetryPayload = {
-          busId: decodedBusId, // enforce safety boundary
+          busId: decodedBusId,
           latitude: Number(incomingData.latitude),
           longitude: Number(incomingData.longitude),
           speed: Number(incomingData.speed) || 0,
@@ -236,21 +181,21 @@ wss.on('connection', (ws, req) => {
           receivedAt: new Date().toISOString()
         };
 
-        // 5. Data Guard: Ensure coordinates aren't corrupted NaN values before broadcasting
         if (isNaN(telemetryPayload.latitude) || isNaN(telemetryPayload.longitude)) {
-          console.log(`[WS WARNING] Skipped telemetry broadcast due to invalid coordinate values on ${decodedBusId}`);
+          console.log(`[WS WARNING] Corrupted coordinate payload skipped on ${decodedBusId}`);
           return;
         }
 
-        // Broadcast out to all tracking screens subscribed to this bus
-       broadcastToBus(decodedBusId, telemetryPayload, ws);
+        // Fixed signature invocation passes context reference cleanly
+        broadcastToBus(decodedBusId, telemetryPayload, ws);
         
-      } catch (e) {
-        console.log(`[WS ERROR] Invalid payload shape on channel ${decodedBusId}`);
+      } catch (parseError) {
+        // IMPROVED: Log the actual processing exception message to make debugging clear
+        console.log(`[WS ERROR] Data processing exception on channel ${decodedBusId}:`, parseError.message);
       }
     });
 
-    ws.on('close', (code, reason) => {
+    ws.on('close', (code) => {
       console.log(`[WS] Connection closed for bus ${decodedBusId}. Code: ${code}`);
       removeConnection(decodedBusId, ws);
     });
@@ -267,84 +212,39 @@ wss.on('connection', (ws, req) => {
 });
 
 // =============================================================================
-// Heartbeat Interval - Clean up dead connections
+// Heartbeat Supervisor
 // =============================================================================
 const heartbeatInterval = setInterval(() => {
   wss.clients.forEach(ws => {
     if (!ws.isAlive) {
-      // Connection is dead, terminate it
       console.log('[HEARTBEAT] Terminating dead connection');
       return ws.terminate();
     }
-
-    // Mark as not alive, next pong will set it back to true
     ws.isAlive = false;
-    ws.ping(); // Send ping to check if connection is still alive
+    ws.ping();
   });
 }, HEARTBEAT_INTERVAL);
 
-// Clean up interval on server shutdown
-wss.on('close', () => {
-  clearInterval(heartbeatInterval);
-});
+wss.on('close', () => { clearInterval(heartbeatInterval); });
 
 // =============================================================================
-// Start Server
+// Start Server Context
 // =============================================================================
 server.listen(PORT, () => {
-  console.log('='.repeat(70));
-  console.log('🚌 School Bus Tracking Server Started');
-  console.log('='.repeat(70));
-  console.log(`HTTP Server running on port: ${PORT}`);
-  console.log(`WebSocket Server available at: ws://localhost:${PORT}/track/:busId`);
-  console.log('');
-  console.log('Endpoints:');
-  console.log(`  GET  /health              - Health check`);
-  console.log(`  POST /api/telemetry       - Submit GPS telemetry data`);
-  console.log(`  WS   /track/:busId        - Subscribe to bus location updates`);
-  console.log('');
-  console.log('Example telemetry payload:');
-  console.log(JSON.stringify({
-    busId: 'bus-123',
-    latitude: 27.7172,
-    longitude: 85.3240,
-    speed: 40,
-    nextStop: 'Main Gate'
-  }, null, 2));
-  console.log('='.repeat(70));
+  console.log(`🚌 Server active on port ${PORT}`);
 });
 
 // =============================================================================
-// Graceful Shutdown
+// Graceful Shutdown Handler
 // =============================================================================
-process.on('SIGTERM', () => {
-  console.log('\n[SIGTERM] Received shutdown signal...');
-  gracefulShutdown();
-});
-
-process.on('SIGINT', () => {
-  console.log('\n[SIGINT] Received interrupt signal...');
-  gracefulShutdown();
-});
+process.on('SIGTERM', () => gracefulShutdown());
+process.on('SIGINT', () => gracefulShutdown());
 
 function gracefulShutdown() {
-  // Close all WebSocket connections
-  wss.clients.forEach(client => {
-    client.close(1001, 'Server shutting down');
-  });
-
-  // Close HTTP server
+  wss.clients.forEach(client => client.close(1001, 'Server shutting down'));
   server.close(() => {
-    console.log('[SHUTDOWN] HTTP server closed');
     clearInterval(heartbeatInterval);
     busConnections.clear();
-    console.log('[SHUTDOWN] Cleanup complete. Exiting.');
     process.exit(0);
   });
-
-  // Force exit after 10 seconds if graceful shutdown fails
-  setTimeout(() => {
-    console.error('[SHUTDOWN] Forced exit after timeout');
-    process.exit(1);
-  }, 10000);
 }
