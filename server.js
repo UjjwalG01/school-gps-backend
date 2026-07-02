@@ -161,70 +161,78 @@ app.post('/api/telemetry', (req, res) => {
 });
 
 // =============================================================================
-// WebSocket Connection Handling
+// WebSocket Connection Handling (Updated Sections)
 // =============================================================================
 
 wss.on('connection', (ws, req) => {
-  // Extract busId from URL path
-  // URL pattern: /track/:busId
-  const urlParts = req.url.split('/');
-  const busId = urlParts[urlParts.length - 1];
+  try {
+    // Robust parsing handles trailing slashes, hashes, and query parameters cleanly
+    const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    const pathParts = parsedUrl.pathname.split('/').filter(Boolean); // removes empty spaces
+    
+    // Path should be ['track', ':busId']
+    const busId = pathParts[1];
 
-  if (!busId || busId === 'track') {
-    ws.close(4000, 'Invalid busId. Use: ws://server/track/:busId');
-    return;
-  }
-
-  // Decode URL-encoded busId (handles special characters)
-  const decodedBusId = decodeURIComponent(busId);
-
-  console.log(`[WS] New connection request for bus: ${decodedBusId} from ${req.socket.remoteAddress}`);
-
-  // Add connection to the bus tracking group
-  addConnection(decodedBusId, ws);
-
-  // Send initial acknowledgment to client
-  ws.send(JSON.stringify({
-    type: 'connected',
-    busId: decodedBusId,
-    message: `Successfully connected to track bus ${decodedBusId}`,
-    timestamp: new Date().toISOString()
-  }));
-
-  // ---------------------------------------------------------------------------
-  // Heartbeat Mechanism - Keep connection alive and detect dead connections
-  // ---------------------------------------------------------------------------
-  ws.isAlive = true;
-  ws.lastPongTime = Date.now();
-
-  // Handle pong responses from client
-  ws.on('pong', () => {
-    ws.isAlive = true;
-    ws.lastPongTime = Date.now();
-  });
-
-  // Handle incoming messages (if needed for future features)
-  ws.on('message', (message) => {
-    try {
-      const data = JSON.parse(message);
-      console.log(`[WS MESSAGE] Received from bus ${decodedBusId}:`, data);
-      // Can handle client-to-server messages here if needed
-    } catch (e) {
-      console.log(`[WS MESSAGE] Non-JSON message from ${decodedBusId}:`, message.toString());
+    if (pathParts[0] !== 'track' || !busId) {
+      ws.close(4000, 'Invalid routing path. Use syntax: ws://server/track/:busId');
+      return;
     }
-  });
 
-  // Handle connection close
-  ws.on('close', (code, reason) => {
-    console.log(`[WS] Connection closed for bus ${decodedBusId}. Code: ${code}, Reason: ${reason || 'No reason provided'}`);
-    removeConnection(decodedBusId, ws);
-  });
+    const decodedBusId = decodeURIComponent(busId);
+    console.log(`[WS] Handshake approved for bus: ${decodedBusId}`);
 
-  // Handle errors
-  ws.on('error', (error) => {
-    console.error(`[WS ERROR] Connection error for bus ${decodedBusId}:`, error.message);
-    removeConnection(decodedBusId, ws);
-  });
+    // Add connection to tracking group memory map
+    addConnection(decodedBusId, ws);
+
+    ws.send(JSON.stringify({
+      type: 'connected',
+      busId: decodedBusId,
+      message: `Stream tunnel established for tracking target: ${decodedBusId}`,
+      timestamp: new Date().toISOString()
+    }));
+
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
+
+    // --- FIX: Broadcast telemetry when received directly over WebSockets ---
+    ws.on('message', (message) => {
+      try {
+        const incomingData = JSON.parse(message);
+        
+        // Build uniform telemetry structure matching the POST schema
+        const telemetryPayload = {
+          busId: decodedBusId, // enforce path safety boundary
+          latitude: Number(incomingData.latitude),
+          longitude: Number(incomingData.longitude),
+          speed: Number(incomingData.speed) || 0,
+          nextStop: incomingData.nextStop || null,
+          heading: incomingData.heading || null,
+          timestamp: incomingData.timestamp || new Date().toISOString(),
+          receivedAt: new Date().toISOString()
+        };
+
+        // Broadcast out to all tracking screens subscribed to this bus
+        broadcastToBus(decodedBusId, telemetryPayload);
+        
+      } catch (e) {
+        console.log(`[WS ERROR] Invalid payload shape on channel ${decodedBusId}`);
+      }
+    });
+
+    ws.on('close', (code, reason) => {
+      console.log(`[WS] Connection closed for bus ${decodedBusId}. Code: ${code}`);
+      removeConnection(decodedBusId, ws);
+    });
+
+    ws.on('error', (error) => {
+      console.error(`[WS SYSTEM ERROR] ${decodedBusId}:`, error.message);
+      removeConnection(decodedBusId, ws);
+    });
+
+  } catch (err) {
+    console.error('[WS HANDSHAKE CRASH]', err.message);
+    ws.close(1011, 'Internal Server Handshake Error');
+  }
 });
 
 // =============================================================================
