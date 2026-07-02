@@ -38,7 +38,6 @@ const server = http.createServer(app);
 // Create WebSocket server attached to the HTTP server
 const wss = new WebSocket.Server({ 
   server,
-  path: '/track'
 });
 
 // =============================================================================
